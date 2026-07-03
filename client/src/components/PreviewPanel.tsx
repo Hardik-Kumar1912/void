@@ -1,6 +1,6 @@
 "use client";
 
-import { FILE_ORDER, GeneratedFile, ImplementationStep, ProjectSummary } from "@/lib/coderBuddy";
+import { GeneratedFile, ImplementationStep, ProjectSummary } from "@/lib/coderBuddy";
 
 type InspectorTab = "preview" | "plan";
 
@@ -27,12 +27,8 @@ export function PreviewPanel({
   onReload,
   onOpenPreview,
 }: PreviewPanelProps) {
-  const displaySteps = steps.length
-    ? steps
-    : FILE_ORDER.map((path) => ({
-      filepath: path,
-      task_description: "Waiting for architect output.",
-    }));
+  const hasSteps = steps.length > 0;
+  const hasSummary = projectSummary !== null;
 
   return (
     <aside className="workspace-panel min-w-0">
@@ -81,47 +77,59 @@ export function PreviewPanel({
         </div>
       ) : (
         <div className="panel-body overflow-y-auto">
-          {projectSummary ? (
-            <section className="summary-block">
-              <h3 className="text-base font-semibold text-zinc-100">
-                {projectSummary.name}
-              </h3>
-              <p className="mt-2 text-sm leading-6 text-zinc-400">
-                {projectSummary.description}
+          {!hasSummary && !hasSteps ? (
+            <div className="preview-empty">
+              <p className="text-sm font-semibold text-zinc-600">No plan yet</p>
+              <p className="mt-2 text-sm leading-6 text-zinc-600">
+                The architect&apos;s implementation plan will appear here once generation starts.
               </p>
-              {projectSummary.features.length ? (
-                <div className="mt-4 flex flex-wrap gap-2">
-                  {projectSummary.features.slice(0, 6).map((feature) => (
-                    <span key={feature} className="feature-pill">
-                      {feature}
-                    </span>
-                  ))}
-                </div>
-              ) : null}
-            </section>
-          ) : null}
-
-          <div className="plan-list">
-            {displaySteps.map((step, index) => {
-              const fileReady = files.find((file) => file.path === step.filepath)?.exists;
-
-              return (
-                <article key={`${step.filepath}-${index}`} className="plan-item">
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="truncate text-sm font-semibold text-zinc-100">
-                      {index + 1}. {step.filepath}
-                    </span>
-                    <span className={fileReady ? "text-xs text-lime-300" : "text-xs text-zinc-500"}>
-                      {fileReady ? "done" : "pending"}
-                    </span>
-                  </div>
-                  <p className="mt-2 text-sm leading-6 text-zinc-500">
-                    {step.task_description}
+            </div>
+          ) : (
+            <>
+              {hasSummary && (
+                <section className="summary-block">
+                  <h3 className="text-base font-semibold text-zinc-100">
+                    {projectSummary!.name}
+                  </h3>
+                  <p className="mt-2 text-sm leading-6 text-zinc-400">
+                    {projectSummary!.description}
                   </p>
-                </article>
-              );
-            })}
-          </div>
+                  {projectSummary!.features.length ? (
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      {projectSummary!.features.slice(0, 6).map((feature) => (
+                        <span key={feature} className="feature-pill">
+                          {feature}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </section>
+              )}
+
+              {hasSteps && (
+                <div className="plan-list">
+                  {steps.map((step, index) => {
+                    const fileReady = files.find((file) => file.path === step.filepath)?.exists;
+                    return (
+                      <article key={`${step.filepath}-${index}`} className="plan-item">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="truncate text-sm font-semibold text-zinc-100">
+                            {index + 1}. {step.filepath}
+                          </span>
+                          <span className={fileReady ? "text-xs text-lime-300" : "text-xs text-zinc-500"}>
+                            {fileReady ? "done" : "pending"}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-sm leading-6 text-zinc-500">
+                          {step.task_description}
+                        </p>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </>
+          )}
         </div>
       )}
     </aside>

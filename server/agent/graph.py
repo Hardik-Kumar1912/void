@@ -97,8 +97,12 @@ def project_file_snapshot(max_chars_per_file: int = 12000) -> str:
 def planner_agent(state: dict) -> dict:
     """Converts user prompt into a structured Plan (with retry)."""
     user_prompt = state["user_prompt"]
+    is_revision = state.get("is_revision", False)
+    current_files_snapshot = state.get("current_files_snapshot", None)
     resp = safe_llm_invoke(
-        lambda: llm.with_structured_output(Plan).invoke(planner_prompt(user_prompt))
+        lambda: llm.with_structured_output(Plan).invoke(
+            planner_prompt(user_prompt, is_revision=is_revision, current_files_snapshot=current_files_snapshot)
+        )
     )
     return {"plan": resp}
 
@@ -106,9 +110,10 @@ def planner_agent(state: dict) -> dict:
 def architect_agent(state: dict) -> dict:
     """Creates TaskPlan from Plan (with retry)."""
     plan: Plan = state["plan"]
+    is_revision = state.get("is_revision", False)
     resp: TaskPlan = safe_llm_invoke(
         lambda: llm.with_structured_output(TaskPlan).invoke(
-            architect_prompt(plan=plan.model_dump_json())
+            architect_prompt(plan=plan.model_dump_json(), is_revision=is_revision)
         )
     )
     resp.plan = plan  # type: ignore[attr-defined]
@@ -131,6 +136,7 @@ def coder_step_node(state: dict) -> dict:
     - Returns status="CONTINUE" when a step succeeds and more steps remain.
     """
     coder_state: CoderState = state.get("coder_state")
+    is_revision = state.get("is_revision", False)
     if coder_state is None:
         coder_state = CoderState(
             task_plan=state["task_plan"],
@@ -154,10 +160,17 @@ def coder_step_node(state: dict) -> dict:
         except Exception:
             existing_content = ""
 
+        revision_note = (
+            "\n⚠️  REVISION MODE: You are editing an existing file. "
+            "Read the existing content above carefully. "
+            "Preserve all working code not mentioned in the task.\n"
+        ) if is_revision else ""
+
         user_msg_content = (
             f"Task: {current_task.task_description}\n"
             f"File: {current_task.filepath}\n"
             f"Existing content:\n{existing_content}\n"
+            f"{revision_note}"
             "Existing project snapshot:\n"
             f"{project_file_snapshot()}\n\n"
             f"Available tools: {ALLOWED_CODER_TOOL_NAMES}.\n"
@@ -166,7 +179,7 @@ def coder_step_node(state: dict) -> dict:
             "Use write_file(path, content) to save your changes."
         )
         coder_state.messages = [
-            SystemMessage(content=coder_system_prompt()),
+            SystemMessage(content=coder_system_prompt(is_revision=is_revision)),
             HumanMessage(content=user_msg_content),
         ]
 

@@ -5,13 +5,15 @@ import re
 import shutil
 import time
 import zipfile
+from contextlib import asynccontextmanager
 from io import BytesIO
+from typing import Optional
 from fastapi import FastAPI
 from fastapi import Header, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dotenv import load_dotenv # ◄ Added
+from dotenv import load_dotenv
 load_dotenv(override=True)
 api_key = os.getenv("GROQ_API_KEY")
 if api_key:
@@ -19,7 +21,7 @@ if api_key:
 else:
     print("ERROR: API Key is still MISSING. Python cannot see the .env file!")
 # Import your existing graph!
-from agent.graph import agent 
+from agent.graph import agent
 from agent.tools import (
     PROJECTS_ROOT,
     get_project_root,
@@ -29,7 +31,40 @@ from agent.tools import (
     use_project_root,
 )
 
-app = FastAPI()
+
+
+class CurrentFiles(BaseModel):
+    """The current state of the three project files sent from the frontend for revision."""
+    html: str = ""
+    css: str = ""
+    js: str = ""
+
+
+class PromptRequest(BaseModel):
+    prompt: str
+    max_retries: int = 3
+    recursion_limit: int = 150
+    current_files: Optional[CurrentFiles] = None  # Present only on revision requests
+    is_revision: bool = False                      # True when editing an existing project
+
+
+GENERATED_FILES = ("index.html", "styles.css", "script.js")
+SESSION_ID_PATTERN = re.compile(r"[^a-zA-Z0-9_-]")
+SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+PROJECT_RETENTION_SECONDS = int(os.getenv("PROJECT_RETENTION_SECONDS", "7200"))  # 2 hours default
+last_cleanup_at = 0.0
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run cleanup of old sessions on startup, then yield for normal operation."""
+    global last_cleanup_at
+    last_cleanup_at = 0.0  # force cleanup to run on first request
+    cleanup_old_project_sessions()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 frontend_origins = [
     origin.strip()
     for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
@@ -44,18 +79,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-class PromptRequest(BaseModel):
-    prompt: str
-    max_retries: int = 3
-    recursion_limit: int = 150
-
-
-GENERATED_FILES = ("index.html", "styles.css", "script.js")
-SESSION_ID_PATTERN = re.compile(r"[^a-zA-Z0-9_-]")
-SESSION_LOCKS: dict[str, asyncio.Lock] = {}
-PROJECT_RETENTION_SECONDS = int(os.getenv("PROJECT_RETENTION_SECONDS", "86400"))
-last_cleanup_at = 0.0
 
 
 def clean_session_id(session_id: str | None) -> str:
@@ -148,16 +171,33 @@ def no_store_headers() -> dict[str, str]:
 def cache_bust_index_html(content: str) -> str:
     version = str(int(time.time() * 1000))
     content = re.sub(
-        r'href=(["\'])/?styles\.css(?:\?[^"\']*)?\1',
+        r'href=(["\'])/?styles\.css(?:\?[^"\']*)?\\1',
         rf'href=\1styles.css?v={version}\1',
         content,
     )
     content = re.sub(
-        r'src=(["\'])/?script\.js(?:\?[^"\']*)?\1',
+        r'src=(["\'])/?script\.js(?:\?[^"\']*)?\\1',
         rf'src=\1script.js?v={version}\1',
         content,
     )
     return content
+
+
+def write_current_files_to_disk(current_files: CurrentFiles) -> None:
+    """
+    Write the frontend's current file contents to the project folder on disk.
+    This ensures the agent reads the most up-to-date code when revising.
+    """
+    file_map = {
+        "index.html": current_files.html,
+        "styles.css": current_files.css,
+        "script.js": current_files.js,
+    }
+    for filename, content in file_map.items():
+        if content.strip():
+            file_path = safe_path_for_project(filename)
+            file_path.write_text(content, encoding="utf-8")
+
 
 # Helper function to prevent JSON crashes with custom graph states
 def safe_serialize(obj):
@@ -171,6 +211,7 @@ def safe_serialize(obj):
     except Exception:
         return str(obj)
 
+
 @app.post("/api/generate")  # Unified URL matching the frontend fetch path
 async def generate_code(
     request: PromptRequest,
@@ -179,23 +220,49 @@ async def generate_code(
     cleanup_old_project_sessions()
     session_id = clean_session_id(x_coder_buddy_session)
     lock = get_session_lock(session_id)
-    
+
+    # Determine if this is a revision or a fresh generation
+    is_revision = request.is_revision or (request.current_files is not None)
+
     # Changed to an 'async def' generator for enterprise-grade performance
     async def event_generator():
         if lock.locked():
-            yield f"data: {json.dumps({'error': 'This session is already generating a project.'})}\n\n"
+            yield f"data: {json.dumps({'error': 'This session is already generating a project.'})}\\n\\n"
             return
 
         token = use_project_root(session_project_root(session_id))
         await lock.acquire()
         try:
             init_project_root()
-            clear_project_folder()
-            yield f"data: {json.dumps({'system': {'status': 'CLEANED'}})}\n\n"
+
+            if is_revision and request.current_files is not None:
+                # REVISION MODE: Write the current frontend files to disk so the
+                # agent's read_file tool sees the most up-to-date code.
+                write_current_files_to_disk(request.current_files)
+                yield f"data: {json.dumps({'system': {'status': 'REVISION_START'}})}\\n\\n"
+            else:
+                # NEW PROJECT: Clear any previous files for this session.
+                clear_project_folder()
+                yield f"data: {json.dumps({'system': {'status': 'CLEANED'}})}\\n\\n"
+
+            # Build the initial state for the agent graph
+            initial_state: dict = {
+                "user_prompt": request.prompt,
+                "max_retries": request.max_retries,
+                "is_revision": is_revision,
+            }
+
+            # Pass a snapshot of current file contents so prompts can reference them
+            if is_revision and request.current_files is not None:
+                initial_state["current_files_snapshot"] = {
+                    "index.html": request.current_files.html,
+                    "styles.css": request.current_files.css,
+                    "script.js": request.current_files.js,
+                }
 
             # .astream() handles network requests concurrently without blocking your server threads
             async for chunk in agent.astream(
-                {"user_prompt": request.prompt, "max_retries": request.max_retries},
+                initial_state,
                 {"recursion_limit": request.recursion_limit},
                 stream_mode="updates"
             ):
@@ -203,17 +270,17 @@ async def generate_code(
                 serializable_chunk = json.loads(
                     json.dumps(chunk, default=safe_serialize)
                 )
-                
+
                 # Format perfectly as Server-Sent Events (SSE)
-                yield f"data: {json.dumps(serializable_chunk)}\n\n"
-                await asyncio.sleep(0.01) # Yields control to the event loop safely
-                
+                yield f"data: {json.dumps(serializable_chunk)}\\n\\n"
+                await asyncio.sleep(0.01)  # Yields control to the event loop safely
+
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield f"data: {json.dumps({'error': str(e)})}\\n\\n"
         finally:
             lock.release()
             reset_project_root(token)
-            
+
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
@@ -333,3 +400,46 @@ async def serve_generated_file(session_id: str, path: str):
         )
     finally:
         reset_project_root(token)
+
+
+@app.delete("/api/cleanup-sessions")
+async def cleanup_sessions():
+    """
+    Immediately remove all session folders whose files are older than
+    PROJECT_RETENTION_SECONDS, bypassing the normal 5-minute cooldown.
+    Safe to call at any time (running sessions are never touched because
+    their files are being actively modified).
+    """
+    global last_cleanup_at
+    last_cleanup_at = 0.0  # reset so cleanup runs unconditionally
+
+    PROJECTS_ROOT.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    removed = []
+
+    for child in PROJECTS_ROOT.iterdir():
+        if not child.is_dir():
+            continue
+
+        resolved_child = child.resolve()
+        if PROJECTS_ROOT.resolve() not in resolved_child.parents:
+            continue
+
+        try:
+            latest_mtime = max(
+                (path.stat().st_mtime for path in child.rglob("*")),
+                default=child.stat().st_mtime,
+            )
+        except OSError:
+            continue
+
+        if PROJECT_RETENTION_SECONDS <= 0 or now - latest_mtime > PROJECT_RETENTION_SECONDS:
+            shutil.rmtree(child, ignore_errors=True)
+            removed.append(child.name)
+
+    last_cleanup_at = now
+    return {
+        "status": "ok",
+        "removed_sessions": removed,
+        "retention_seconds": PROJECT_RETENTION_SECONDS,
+    }

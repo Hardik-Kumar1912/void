@@ -29,6 +29,16 @@ export type ProjectSummary = {
   features: string[];
 };
 
+/** A single message turn in the conversation thread */
+export type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  /** Agent logs emitted during this specific turn (attached to assistant messages) */
+  logs: ActivityLog[];
+  timestamp: string;
+};
+
 export type RunState = "idle" | "running" | "complete" | "failed";
 export type RecordValue = Record<string, unknown>;
 
@@ -143,6 +153,11 @@ export function describeChunk(node: string, payload: unknown): ActivityLog {
   if (status === "CLEANED") {
     details = "Previous generated files were cleared for this session.";
     tone = "warning";
+  }
+
+  if (status === "REVISION_START") {
+    details = "Current files loaded. Starting revision...";
+    tone = "info";
   }
 
   return {
