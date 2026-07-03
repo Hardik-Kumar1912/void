@@ -1,0 +1,20 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+.uv-cache/
+
+# Generated files (created at runtime)
+generated_project/
+generated_projects/
+.tmp/
+
+# Dev files
+.env
+*.log
+.git/
+.gitignore
